@@ -1,0 +1,717 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import sympy as sp
+import tkinter as tk
+from tkinter import messagebox, ttk
+import threading
+import math
+import datetime
+
+# --- Hàm tiện ích (Utility Functions) ---
+
+def get_timeframe(tf_str: str):
+    """
+    Ánh xạ chuỗi khung thời gian (ví dụ: "M1", "H4") sang các hằng số khung thời gian của MetaTrader 5.
+    """
+    mapping = {
+        "M1": mt5.TIMEFRAME_M1,
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "M30": mt5.TIMEFRAME_M30,
+        "H1": mt5.TIMEFRAME_H1,
+        "H4": mt5.TIMEFRAME_H4,
+        "D1": mt5.TIMEFRAME_D1,
+        "W1": mt5.TIMEFRAME_W1,
+        "MN1": mt5.TIMEFRAME_MN1,
+    }
+    return mapping.get(tf_str.upper())
+
+
+def find_exness_symbol(base_symbol: str) -> str:
+    """
+    Tìm kiếm tên symbol chính xác trên server MT5.
+    Ưu tiên symbol chính xác (ví dụ: "EURUSD") hơn symbol có hậu tố 'M' (ví dụ: "EURUSDM").
+    Nếu không tìm thấy symbol chính xác, sẽ tìm symbol có hậu tố 'M' hoặc ứng cử viên đầu tiên.
+    """
+    all_syms = mt5.symbols_get()
+    
+    # Chuyển base_symbol sang chữ hoa để so sánh không phân biệt chữ hoa/thường
+    base_symbol_upper = base_symbol.upper()
+
+    # Bước 1: Tìm kiếm symbol chính xác (không có hậu tố)
+    for s in all_syms:
+        if s.name.upper() == base_symbol_upper:
+            return s.name
+
+    # Bước 2: Tìm kiếm symbol có hậu tố 'M' (phổ biến với Exness)
+    for s in all_syms:
+        if s.name.upper() == base_symbol_upper + "M":
+            return s.name
+
+    # Bước 3: Tìm bất kỳ symbol nào bắt đầu bằng base_symbol (nếu 2 bước trên không tìm thấy)
+    candidates = [s.name for s in all_syms if s.name.upper().startswith(base_symbol_upper)]
+    if candidates:
+        return candidates[0] # Trả về ứng cử viên đầu tiên
+
+    # Nếu không tìm thấy symbol nào khớp
+    raise RuntimeError(f"Không tìm thấy symbol nào khớp '{base_symbol}' trên server.")
+
+
+def get_average_prices(symbol: str, timeframe: int, counts: dict) -> dict:
+    """
+    Tải dữ liệu nến từ MT5 và tính toán giá trung bình cho các mức high, low, close
+    dựa trên số lượng nến được chỉ định trong 'counts'.
+    """
+    averages = {}
+    for key, bar_count in counts.items():
+        # Lấy dữ liệu nến từ vị trí hiện tại lùi về sau 'bar_count' nến
+        # mt5.copy_rates_from_pos(symbol, timeframe, index, count)
+        # index = 1 để lấy dữ liệu từ nến trước nến hiện tại (nến đã đóng)
+        rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, bar_count)
+        
+        actual_bars = len(rates) if rates is not None else 0
+        if rates is None or actual_bars < bar_count:
+            # Nếu không đủ dữ liệu, báo lỗi Runtime Error
+            raise RuntimeError(f"Không đủ dữ liệu cho {key} ({symbol}, {mt5.timeframe_to_string(timeframe)}): "
+                               f"chỉ có {actual_bars}/{bar_count} nến.")
+        
+        df = pd.DataFrame(rates)
+        
+        # Tính giá trị trung bình dựa trên key (high, low, close)
+        if key.startswith("high"):
+            value = df["high"].mean()
+        elif key.startswith("low"):
+            value = df["low"].mean()
+        elif key.startswith("close"):
+            value = df["close"].mean()
+        else:
+            raise ValueError(f"Key không hợp lệ để tính giá trung bình: {key}. Phải là 'high', 'low' hoặc 'close'.")
+        
+        # Làm tròn giá trị trung bình để duy trì độ chính xác cao nhất trước khi truyền vào sympy
+        # Sử dụng làm tròn đến 8 chữ số thập phân là đủ cho hầu hết các công cụ
+        averages[key] = round(value, 8) 
+    return averages
+
+
+def find_x(average_prices: dict, prediction_mode: str, decimal_places: int = 5) -> list:
+    """
+    Giải phương trình toán học để tìm các giá trị 'x' dựa trên các điểm giá trung bình.
+    
+    Các giá trị giá được nhân 100000 để làm việc với số nguyên lớn hơn trong sympy,
+    giúp sympy xử lý tốt hơn với độ chính xác cao và tránh các vấn đề về số học dấu phẩy động nhỏ.
+    
+    prediction_mode: Chế độ dự đoán ('close', 'highest', 'lowest') để điều chỉnh công thức.
+    decimal_places: Số chữ số thập phân để làm tròn các nghiệm cuối cùng. Mặc định là 5.
+    """
+    x = sp.symbols("x", real=True) # Định nghĩa 'x' là một biến thực
+    
+    # Điều chỉnh các điểm A, B, C, D, E dựa trên chế độ dự đoán do người dùng chọn
+    if prediction_mode == 'highest':
+        # Chế độ dự đoán giá CAO NHẤT
+        A = (5, average_prices["low_5"] * 100000)
+        B = (3, average_prices["close_3"] * 100000)
+        C = (2, average_prices["high_2"] * 100000)
+        D = (1, average_prices["low_1"] * 100000)
+        E = (1, average_prices["close_1"] * 100000)
+
+    elif prediction_mode == 'lowest':
+        # Chế độ dự đoán giá THẤP NHẤT
+        A = (5, average_prices["close_5"] * 100000)
+        B = (3, average_prices["high_3"] * 100000)
+        C = (2, average_prices["low_2"] * 100000)
+        D = (1, average_prices["close_1"] * 100000)
+        E = (1, average_prices["high_1"] * 100000)
+
+    else: # Mặc định là 'close'
+        # Chế độ dự đoán giá ĐÓNG CỬA
+        A = (5, average_prices["low_5"] * 100000)
+        B = (3, average_prices["high_3"] * 100000)
+        C = (2, average_prices["close_2"] * 100000)
+        D = (1, average_prices["low_1"] * 100000)
+        E = (1, average_prices["high_1"] * 100000)
+
+    F = (0, x) # Điểm có giá trị 'x' cần tìm (x-coordinate là 0 để đại diện cho điểm hiện tại hoặc một mức giá)
+
+    def dist(P, Q):
+        """Tính khoảng cách Euclide giữa hai điểm P(x1, y1) và Q(x2, y2)."""
+        return sp.sqrt((P[0] - Q[0]) ** 2 + (P[1] - Q[1]) ** 2)
+
+    # Tính các khoảng cách giữa các cặp điểm theo công thức của bạn
+    BC = dist(B, C)
+    EF = dist(E, F)
+    AC = dist(A, C)
+    DF = dist(D, F)
+    
+    # Thiết lập phương trình theo tỷ lệ khoảng cách: BC/EF = AC/DF
+    # Đây là điểm cốt lõi của logic tính toán, đại diện cho một mối quan hệ hình học giữa các điểm giá.
+    eq = sp.Eq(BC / EF, AC / DF)
+    
+    # Giải phương trình để tìm các giá trị của 'x'
+    sols = sp.solve(eq, x)
+    
+    # Xử lý các nghiệm:
+    # 1. Chuyển đổi các nghiệm sympy về dạng số thực dấu phẩy động.
+    # 2. Chia lại cho 100000 để đưa về giá trị giá ban đầu.
+    # 3. Làm tròn các nghiệm theo số chữ số thập phân mong muốn (`decimal_places`).
+    # 4. Chỉ giữ lại các nghiệm thực và hợp lệ (không phải NaN, Infinity).
+    cleaned_sols = []
+    for sol in sols:
+        if sol.is_real: # Đảm bảo chỉ lấy nghiệm thực
+            try:
+                value = float(sol.evalf()) / 100000
+                if math.isfinite(value): # Kiểm tra xem giá trị có hữu hạn không (không phải NaN hay Inf)
+                    cleaned_sols.append(round(value, decimal_places)) 
+            except (TypeError, ValueError):
+                # Bỏ qua các nghiệm không thể chuyển đổi hoặc không hợp lệ
+                continue
+    
+    # Sắp xếp các nghiệm và loại bỏ trùng lặp (nếu có)
+    return sorted(list(set(cleaned_sols)))
+
+
+# --- Lớp ứng dụng giao dịch (TradingApp Class) ---
+
+class TradingApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("MT5 Trading App")
+        self.root.geometry("1400x700") 
+        self.root.configure(bg='#f4f4f9') 
+
+        # Danh sách các symbol và khung thời gian mặc định
+        self.symbols = ['AUDCAD', 'EURUSD', 'GBPUSD', 'USDJPY', 'NZDUSD', 'USDCAD', 'EURJPY', 'BTCUSD', 'XAUUSD', 'XAGUSD', 'US30Cash']
+        self.timeframes = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN1']
+
+        # --- KHUNG CHÍNH: Chia cửa sổ thành 2 cột ---
+        self.main_frame = tk.Frame(root, bg='#f4f4f9')
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Cấu hình co giãn cho các cột chính
+        self.main_frame.grid_columnconfigure(0, weight=1) # Cột trái co giãn ít hơn
+        self.main_frame.grid_columnconfigure(1, weight=3) # Cột phải (bảng) co giãn nhiều hơn
+        self.main_frame.grid_rowconfigure(0, weight=1)
+
+        # --- KHUNG TRÁI: Chứa tất cả các tùy chọn và nút ---
+        self.left_frame = tk.Frame(self.main_frame, bg='#e0e6ed', bd=2, relief=tk.GROOVE)
+        self.left_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
+        
+        # Cấu hình grid_rowconfigure để đẩy nút "Kết Thúc" xuống dưới cùng
+        # Các hàng từ 0 đến 12 sẽ nằm gần nhau
+        self.left_frame.grid_rowconfigure(13, weight=1) # Hàng 13 chứa nút "Kết Thúc" sẽ co giãn
+        
+        # Cấu hình các cột trong left_frame để các widget có thể trải dài nếu cần
+        self.left_frame.grid_columnconfigure(0, weight=1)
+        self.left_frame.grid_columnconfigure(1, weight=1)
+
+
+        # Chọn loại tài khoản
+        tk.Label(self.left_frame, text="Chọn loại tài khoản:", font=("Arial", 12), bg='#e0e6ed', fg='#333').grid(row=0, column=0, columnspan=2, pady=5, sticky='w')
+        self.account_var = tk.StringVar(value="Real") 
+        
+        account_radio_frame = tk.Frame(self.left_frame, bg='#e0e6ed')
+        account_radio_frame.grid(row=1, column=0, columnspan=2, pady=5, sticky='w')
+        tk.Radiobutton(account_radio_frame, text="Real", variable=self.account_var, value="Real", bg='#e0e6ed', font=("Arial", 11), command=self.toggle_custom_account_fields).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(account_radio_frame, text="Demo", variable=self.account_var, value="Demo", bg='#e0e6ed', font=("Arial", 11), command=self.toggle_custom_account_fields).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(account_radio_frame, text="Tài khoản khác", variable=self.account_var, value="Custom", bg='#e0e6ed', font=("Arial", 11), command=self.toggle_custom_account_fields).pack(side=tk.LEFT, padx=5)
+
+        # --- Khung chứa các trường nhập liệu tài khoản tùy chỉnh ---
+        # Khung này được tạo và định vị bằng grid ngay từ đầu, nhưng sẽ được ẩn đi ban đầu.
+        self.custom_account_frame = tk.Frame(self.left_frame, bg='#e0e6ed')
+        
+        tk.Label(self.custom_account_frame, text="Login:", font=("Arial", 10), bg='#e0e6ed', fg='#333').grid(row=0, column=0, padx=2, pady=2, sticky='w')
+        self.custom_login_entry = tk.Entry(self.custom_account_frame, font=("Arial", 10), width=15)
+        self.custom_login_entry.grid(row=0, column=1, padx=2, pady=2, sticky='ew')
+
+        tk.Label(self.custom_account_frame, text="Pass:", font=("Arial", 10), bg='#e0e6ed', fg='#333').grid(row=0, column=2, padx=2, pady=2, sticky='w')
+        self.custom_password_entry = tk.Entry(self.custom_account_frame, font=("Arial", 10), width=15, show='*') 
+        self.custom_password_entry.grid(row=0, column=3, padx=2, pady=2, sticky='ew')
+
+        tk.Label(self.custom_account_frame, text="Server:", font=("Arial", 10), bg='#e0e6ed', fg='#333').grid(row=1, column=0, padx=2, pady=2, sticky='w') 
+        self.custom_server_entry = tk.Entry(self.custom_account_frame, font=("Arial", 10), width=35)
+        self.custom_server_entry.grid(row=1, column=1, columnspan=3, padx=2, pady=2, sticky='ew')
+
+        # Cấu hình cột co giãn trong custom_account_frame để các ô nhập liệu được cân đối
+        self.custom_account_frame.grid_columnconfigure(1, weight=1) 
+        self.custom_account_frame.grid_columnconfigure(3, weight=1) 
+
+        # Gọi hàm này một lần khi khởi tạo để đảm bảo trạng thái ban đầu đúng (ẩn các trường tùy chỉnh)
+        self.toggle_custom_account_fields()
+
+        # Nút kết nối MT5
+        tk.Button(self.left_frame, text="Kết Nối MT5", font=("Arial", 12, "bold"), command=self.connect_mt5, bg='#2196F3', fg='white', relief=tk.RAISED).grid(row=3, column=0, columnspan=2, pady=10)
+
+        # --- THÊM MỚI: Khu vực chọn chế độ dự đoán ---
+        tk.Label(self.left_frame, text="Chọn Chế Độ Dự Đoán:", font=("Arial", 12), bg='#e0e6ed', fg='#333').grid(row=4, column=0, columnspan=2, pady=5, sticky='w')
+        self.prediction_mode_var = tk.StringVar(value="close") # Mặc định là 'close'
+        
+        prediction_radio_frame = tk.Frame(self.left_frame, bg='#e0e6ed')
+        prediction_radio_frame.grid(row=5, column=0, columnspan=2, pady=5, sticky='w')
+        tk.Radiobutton(prediction_radio_frame, text="Đóng cửa", variable=self.prediction_mode_var, value="close", bg='#e0e6ed', font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(prediction_radio_frame, text="Cao nhất", variable=self.prediction_mode_var, value="highest", bg='#e0e6ed', font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(prediction_radio_frame, text="Thấp nhất", variable=self.prediction_mode_var, value="lowest", bg='#e0e6ed', font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
+        # --- KẾT THÚC THÊM MỚI ---
+
+        # Khu vực nhập liệu cho Cặp tiền tệ và Khung thời gian (trong left_frame)
+        tk.Label(self.left_frame, text="Chọn hoặc Nhập Cặp Tiền Tệ:", font=("Arial", 12), bg='#e0e6ed', fg='#333').grid(row=6, column=0, columnspan=2, pady=5, sticky='w')
+        self.symbol_combobox = ttk.Combobox(self.left_frame, values=self.symbols, state="normal", font=("Arial", 12), width=25)
+        self.symbol_combobox.set(self.symbols[0]) 
+        self.symbol_combobox.grid(row=7, column=0, columnspan=2, pady=5, sticky='ew')
+
+        tk.Label(self.left_frame, text="Chọn hoặc Nhập Khung Thời Gian (cách nhau dấu phẩy):", font=("Arial", 12), bg='#e0e6ed', fg='#333').grid(row=8, column=0, columnspan=2, pady=5, sticky='w')
+        self.timeframe_combobox = ttk.Combobox(self.left_frame, values=self.timeframes, state="normal", font=("Arial", 12), width=25)
+        self.timeframe_combobox.set(self.timeframes[0]) 
+        self.timeframe_combobox.grid(row=9, column=0, columnspan=2, pady=5, sticky='ew')
+
+        self.root.bind("<Return>", self.calculate) # Gán phím Enter để kích hoạt tính toán
+
+        # Nút tìm kiếm nhanh (chạy trong luồng riêng)
+        tk.Button(self.left_frame, text="Tìm Kiếm Nhanh", font=("Arial", 12, "bold"), command=self.start_quick_search_thread, bg='#FF9800', fg='white', relief=tk.RAISED).grid(row=10, column=0, columnspan=2, pady=5)
+
+        # Các nút điều khiển chính (trong left_frame)
+        # Thay đổi pady để các nút gần nhau hơn
+        tk.Button(self.left_frame, text="Tính toán", font=("Arial", 12, "bold"), command=self.calculate, bg='#4CAF50', fg='white', relief=tk.RAISED).grid(row=11, column=0, pady=(10, 5), sticky='ew') 
+        tk.Button(self.left_frame, text="Reset", font=("Arial", 12, "bold"), command=self.reset, bg='#f44336', fg='white', relief=tk.RAISED).grid(row=11, column=1, pady=(10, 5), sticky='ew') 
+        
+        # Nút Kết Thúc đặt ở cuối left_frame
+        # Đặt ở row 13 để tận dụng grid_rowconfigure(13, weight=1)
+        tk.Button(self.left_frame, text="Kết Thúc", font=("Arial", 12, "bold"), command=self.exit_program, bg='#607D8B', fg='white', relief=tk.RAISED).grid(row=13, column=0, columnspan=2, pady=(5, 5), sticky='s')
+
+
+        # --- KHUNG PHẢẢI: Chứa bảng kết quả và thanh tiến trình ---
+        self.right_frame = tk.Frame(self.main_frame, bg='#f4f4f9', bd=2, relief=tk.GROOVE) 
+        self.right_frame.grid(row=0, column=1, sticky='nsew', padx=10, pady=10)
+        self.right_frame.grid_rowconfigure(0, weight=0) # Thanh tiến trình và status không co giãn
+        self.right_frame.grid_rowconfigure(1, weight=1) # Bảng kết quả co giãn
+        self.right_frame.grid_columnconfigure(0, weight=1)
+
+        # Thanh tiến trình và nhãn trạng thái (trong right_frame)
+        self.progress = ttk.Progressbar(self.right_frame, orient='horizontal', length=600, mode='determinate')
+        self.progress.grid(row=0, column=0, sticky='ew', padx=5, pady=5)
+
+        self.status_label = tk.Label(self.right_frame, text="Chưa bắt đầu tìm kiếm", font=("Arial", 10), bg='#f4f4f9', fg='blue')
+        self.status_label.grid(row=0, column=0, sticky='s', pady=(5,0)) 
+
+        # Khung chứa bảng kết quả với thanh cuộn (trong right_frame)
+        table_container_frame = ttk.Frame(self.right_frame)
+        table_container_frame.grid(row=1, column=0, sticky='nsew', padx=5, pady=5) 
+
+        self.result_table = ttk.Treeview(
+            table_container_frame, 
+            columns=("Symbol", "Time", "Result", "Check", "Warning", "Live Price"),
+            show="headings"
+        )
+        # Thiết lập tiêu đề cột
+        self.result_table.heading("Symbol", text="Cặp Tiền Tệ")
+        self.result_table.heading("Time", text="Time")
+        self.result_table.heading("Result", text="Kết Quả")
+        self.result_table.heading("Check", text="Check")
+        self.result_table.heading("Warning", text="Cảnh Báo")
+        self.result_table.heading("Live Price", text="Giá Live")
+
+        # --- ĐIỀU CHỈNH ĐỘ RỘNG CỘT ---
+        self.result_table.column("Symbol", width=100, anchor='w', stretch=False)
+        self.result_table.column("Time", width=70, anchor='center', stretch=False)
+        self.result_table.column("Result", minwidth=150, width=250, anchor='center', stretch=True) 
+        self.result_table.column("Check", minwidth=150, width=150, anchor='w', stretch=True) 
+        self.result_table.column("Warning", minwidth=150, width=150, anchor='w', stretch=True) 
+        self.result_table.column("Live Price", width=90, anchor='e', stretch=False)
+        # --- KẾT THÚC ĐIỀU CHỈNH ---
+
+        self.result_table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Thêm thanh cuộn ngang và dọc cho bảng
+        h_scroll = ttk.Scrollbar(table_container_frame, orient='horizontal', command=self.result_table.xview)
+        h_scroll.pack(side=tk.BOTTOM, fill='x')
+        v_scroll = ttk.Scrollbar(table_container_frame, orient='vertical', command=self.result_table.yview)
+        v_scroll.pack(side=tk.RIGHT, fill='y')
+
+        self.result_table.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
+
+        self.connected = False # Biến trạng thái kết nối MT5
+
+    def toggle_custom_account_fields(self):
+        """
+        Ẩn hoặc hiện các trường nhập liệu cho tài khoản tùy chỉnh dựa trên lựa chọn Radiobutton.
+        """
+        if self.account_var.get() == "Custom":
+            self.custom_account_frame.grid(row=2, column=0, columnspan=2, pady=5, sticky='ew') 
+        else:
+            self.custom_account_frame.grid_remove() 
+
+    def connect_mt5(self):
+        """
+        Kết nối hoặc ngắt kết nối với MetaTrader 5.
+        Sử dụng thông tin tài khoản đã mã hóa cứng hoặc từ các trường nhập liệu tùy chỉnh.
+        """
+        if self.connected:
+            mt5.shutdown()
+            self.connected = False
+            messagebox.showinfo("Ngắt kết nối", "Đã ngắt kết nối MT5.")
+            return
+
+        selected_account_type = self.account_var.get()
+        LOGIN = None
+        PASSWORD = None
+        SERVER = None
+
+        if selected_account_type == "Real":
+            LOGIN = 127423308
+            PASSWORD = "@Ductho9"
+            SERVER = "Exness-MT5Real7"
+        elif selected_account_type == "Demo":
+            LOGIN = 5036541385 
+            PASSWORD = "E@KxRjN4"
+            SERVER = "MetaQuotes-Demo"
+        elif selected_account_type == "Custom":
+            try:
+                login_str = self.custom_login_entry.get().strip()
+                if not login_str:
+                    raise ValueError("Login ID không được để trống.")
+                LOGIN = int(login_str)
+                PASSWORD = self.custom_password_entry.get().strip()
+                SERVER = self.custom_server_entry.get().strip()
+            except ValueError as e:
+                messagebox.showerror("Lỗi đăng nhập", f"Login ID phải là một số nguyên hợp lệ. {e}")
+                return
+            
+            if not PASSWORD or not SERVER:
+                messagebox.showerror("Lỗi đăng nhập", "Vui lòng nhập đầy đủ Password và Server cho tài khoản tùy chỉnh.")
+                return
+
+        if not mt5.initialize(login=LOGIN, password=PASSWORD, server=SERVER):
+            messagebox.showerror("Lỗi kết nối", f"Không thể kết nối MT5: {mt5.last_error()}."
+                                                 f"\nVui lòng kiểm tra thông tin đăng nhập hoặc kết nối mạng.")
+            self.connected = False
+            return
+
+        self.connected = True
+        messagebox.showinfo("Kết nối thành công", f"Đã kết nối MT5 với tài khoản {selected_account_type}.")
+
+    def calculate_symbol_timeframe(self, symbol: str, tf_str: str) -> dict | None:
+        """
+        Thực hiện tính toán cho một cặp tiền tệ và khung thời gian cụ thể.
+        Trả về một dictionary chứa kết quả nếu tìm thấy nghiệm gần giá hiện tại, 
+        ngược lại trả về None.
+        """
+        tf = get_timeframe(tf_str)
+        if tf is None:
+            return None
+
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            return None
+
+        pip_size = symbol_info.point * 10 
+        decimal_places = symbol_info.digits
+        
+        # Đảm bảo lấy đủ dữ liệu cho tất cả các chế độ
+        counts = {
+            'high_5': 5, 'low_5': 5, 'close_5': 5,
+            'high_3': 3, 'low_3': 3, 'close_3': 3,
+            'high_2': 2, 'low_2': 2, 'close_2': 2,
+            'high_1': 1, 'low_1': 1, 'close_1': 1
+        }
+        try:
+            avgs = get_average_prices(symbol, tf, counts)
+            prediction_mode = self.prediction_mode_var.get()
+            sols = find_x(avgs, prediction_mode, decimal_places)
+            
+            rates = mt5.copy_rates_from_pos(symbol, tf, 0, 1)
+            if not rates:
+                return None
+            live_price = rates[0]['close']
+            current_high = rates[0]['high']
+            current_low = rates[0]['low']
+
+            # Định dạng tất cả các nghiệm đã tìm được
+            formatted_sols = [f"{s:.{decimal_places}f}" for s in sols if math.isfinite(s)] 
+            result_text = ", ".join(formatted_sols)
+
+            # --- CẢI TIẾN: Logic cho cột "Check" - Hiển thị TẤT CẢ các nghiệm đã đi qua ---
+            passed_solutions = []
+            if current_high is not None and current_low is not None:
+                for i, sol in enumerate(sols, 1):
+                    if math.isfinite(sol) and current_low <= sol <= current_high:
+                        passed_solutions.append(f"Nghiệm {i}: {sol:.{decimal_places}f}")
+
+            if passed_solutions:
+                check_text = "Đã đi qua: " + ", ".join(passed_solutions)
+            else:
+                check_text = "Chưa đi qua"
+            # --- KẾT THÚC CẢI TIẾN "Check" ---
+
+
+            # --- ĐIỀU CHỈNH: Logic cho cột "Warning" - Hiển thị TẤT CẢ các nghiệm gần ---
+            close_solutions_info = []
+            if live_price is not None:
+                for i, sol in enumerate(sols, 1):
+                    if math.isfinite(sol):
+                        diff = abs(live_price - sol)
+                        if diff <= 10 * pip_size:
+                            close_solutions_info.append(f"Rất gần Nghiệm {i}: {sol:.{decimal_places}f} ({diff / pip_size:.0f} pip)")
+                        elif diff <= 50 * pip_size:
+                            close_solutions_info.append(f"Gần Nghiệm {i}: {sol:.{decimal_places}f} ({diff / pip_size:.0f} pip)")
+                
+                if close_solutions_info:
+                    warning_text = "; ".join(close_solutions_info)
+                elif sols: # Nếu có nghiệm nhưng không có nghiệm nào gần
+                    warning_text = "Không có nghiệm nào gần ( > 50 pip)" 
+                else: # Nếu không tìm thấy nghiệm nào (sols rỗng)
+                    warning_text = "Không tìm thấy nghiệm hợp lệ"
+            else:
+                warning_text = "Không có giá Live" # Trường hợp không lấy được giá live
+            # --- KẾT THÚC ĐIỀU CHỈNH "Warning" ---
+
+            return {
+                "Symbol": symbol,
+                "Timeframe": tf_str,
+                "Result": result_text, 
+                "Check": check_text, 
+                "Warning": warning_text,
+                "Live Price": round(live_price, decimal_places) 
+            }
+        except RuntimeError as e: # Lỗi khi không đủ dữ liệu
+            return None
+        except Exception as e: # Các lỗi khác trong quá trình tính toán
+            # print(f"Lỗi khi tính toán cho {symbol} {tf_str}: {e}") # Có thể log lỗi chi tiết hơn
+            return None
+
+    def start_quick_search_thread(self):
+        """
+        Khởi tạo luồng tìm kiếm nhanh để không làm treo giao diện người dùng.
+        Hiển thị thông báo và đặt lại thanh tiến trình.
+        """
+        if not self.connected:
+            messagebox.showerror("Chưa kết nối", "Vui lòng kết nối MT5 trước khi tìm kiếm.")
+            return
+        
+        # Xóa các mục cũ trong bảng
+        for item in self.result_table.get_children():
+            self.result_table.delete(item)
+
+        self.status_label.config(text="Đang tìm kiếm, vui lòng chờ...")
+        self.progress['value'] = 0
+        self.root.update_idletasks() # Cập nhật giao diện ngay lập tức
+
+        # Bắt đầu luồng tìm kiếm
+        # Đảm bảo các cập nhật GUI từ luồng phụ được gọi an toàn bằng root.after
+        threading.Thread(target=self._run_quick_search_task, daemon=True).start()
+
+    def _run_quick_search_task(self):
+        """Task chạy quick_search trong luồng riêng để cập nhật GUI an toàn."""
+        self.quick_search()
+        self.root.after(0, self.status_label.config, {"text": "Tìm kiếm hoàn thành!"})
+
+
+    def quick_search(self):
+        """
+        Thực hiện tìm kiếm tự động trên một danh sách các cặp tiền tệ và khung thời gian phổ biến.
+        Cập nhật tiến độ và kết quả trực tiếp lên bảng.
+        """
+        popular_symbols = [
+            'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD',
+            'XAUUSD', 'XAGUSD', 'WTI', 'BRENT', 
+            'BTCUSD', 'ETHUSD', 'LTCUSD', 'XRPUSD', 
+            'US30Cash', 'SPX500Cash', 'DE30Cash' 
+        ]
+        search_timeframes = ['D1', 'W1', 'MN1'] 
+
+        total_tasks = len(popular_symbols) * len(search_timeframes)
+        completed = 0
+        found_results = 0
+
+        for symbol_base in popular_symbols:
+            try:
+                symbol = find_exness_symbol(symbol_base)
+            except RuntimeError as e:
+                # Nếu không tìm thấy symbol, bỏ qua tất cả các khung thời gian cho symbol này
+                completed += len(search_timeframes)
+                self.root.after(0, self.update_progress, completed, total_tasks, found_results)
+                continue
+
+            # Chọn symbol trên MT5 để đảm bảo dữ liệu có sẵn
+            if not mt5.symbol_select(symbol, True):
+                completed += len(search_timeframes)
+                self.root.after(0, self.update_progress, completed, total_tasks, found_results)
+                continue
+            
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None: # Kiểm tra lại thông tin symbol
+                completed += len(search_timeframes)
+                self.root.after(0, self.update_progress, completed, total_tasks, found_results)
+                continue
+            
+            for tf_str in search_timeframes:
+                res = self.calculate_symbol_timeframe(symbol, tf_str)
+                completed += 1
+                
+                # --- ĐIỀU CHỈNH: Chỉ thêm vào bảng nếu cảnh báo không phải là "Không có nghiệm nào gần" hoặc "Không tìm thấy nghiệm hợp lệ" hoặc "Không có giá Live" ---
+                # Nghĩa là, chỉ thêm vào nếu warning_text có chứa thông tin về nghiệm gần
+                if res and res["Warning"] not in ["Không có nghiệm nào gần ( > 50 pip)", "Không tìm thấy nghiệm hợp lệ", "Không có giá Live"]:
+                    # Sử dụng lambda để truyền keyword argument 'values' đúng cách
+                    self.root.after(0, lambda r=res: self.result_table.insert(
+                        "", "end", values=(r["Symbol"], r["Timeframe"], r["Result"], r["Check"], r["Warning"], r["Live Price"])
+                    ))
+                    found_results += 1
+
+                self.root.after(0, self.update_progress, completed, total_tasks, found_results)
+
+        self.root.after(0, self.status_label.config, {"text": f"Tìm kiếm hoàn thành: {found_results} cặp được tìm thấy."})
+
+    def update_progress(self, completed: int, total_tasks: int, found_results: int):
+        """
+        Cập nhật thanh tiến trình và nhãn trạng thái của GUI.
+        Đảm bảo cập nhật hiển thị ngay lập tức.
+        """
+        if total_tasks > 0:
+            percent = int(completed / total_tasks * 100)
+        else:
+            percent = 0 
+        
+        self.progress['value'] = percent
+        self.status_label.config(text=f"Đang tìm kiếm... {completed}/{total_tasks} ({percent}%) - Tìm được {found_results} cặp")
+        # self.root.update_idletasks() # Không cần thiết nếu dùng root.after để gọi hàm này
+
+    def calculate(self, event=None):
+        """
+        Tính toán kết quả cho cặp tiền tệ và khung thời gian do người dùng nhập.
+        Hiển thị kết quả trong bảng.
+        """
+        if not self.connected:
+            messagebox.showerror("Chưa kết nối", "Vui lòng kết nối MT5 trước khi tính toán.")
+            return
+
+        base = self.symbol_combobox.get().strip().upper()
+        timeframe_input = self.timeframe_combobox.get().strip()
+        
+        if not base or not timeframe_input:
+            messagebox.showerror("Lỗi", "Vui lòng nhập cặp tiền tệ và khung thời gian.")
+            return
+
+        try:
+            symbol = find_exness_symbol(base)
+        except RuntimeError as e:
+            messagebox.showerror("Lỗi symbol", str(e))
+            return
+
+        if not mt5.symbol_select(symbol, True):
+            messagebox.showerror("Lỗi", f"Không bật được symbol {symbol} trên MT5. Vui lòng kiểm tra trên Terminal.")
+            return
+        
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            messagebox.showerror("Lỗi", f"Không lấy được thông tin symbol {symbol}. Vui lòng kiểm tra lại tên symbol.")
+            return
+        
+        pip_size = symbol_info.point * 10 
+        decimal_places = symbol_info.digits
+        
+        # Xóa bảng trước khi thêm kết quả mới
+        for item in self.result_table.get_children():
+            self.result_table.delete(item)
+
+        timeframes = [tf.strip() for tf in timeframe_input.split(',') if tf.strip()]
+        if not timeframes:
+            messagebox.showerror("Lỗi", "Vui lòng nhập ít nhất một khung thời gian hợp lệ.")
+            return
+
+        for tf_str in timeframes:
+            tf = get_timeframe(tf_str)
+            if tf is None:
+                messagebox.showwarning("Cảnh báo", f"Khung thời gian '{tf_str}' không hợp lệ và sẽ bị bỏ qua.")
+                continue
+
+            # Đảm bảo lấy đủ dữ liệu cho tất cả các chế độ
+            counts = {
+                'high_5': 5, 'low_5': 5, 'close_5': 5,
+                'high_3': 3, 'low_3': 3, 'close_3': 3,
+                'high_2': 2, 'low_2': 2, 'close_2': 2,
+                'high_1': 1, 'low_1': 1, 'close_1': 1
+            }
+            try:
+                avgs = get_average_prices(symbol, tf, counts)
+                prediction_mode = self.prediction_mode_var.get()
+                sols = find_x(avgs, prediction_mode, decimal_places)
+                
+                formatted_sols = [f"{s:.{decimal_places}f}" for s in sols if math.isfinite(s)]
+                result_text = ", ".join(formatted_sols)
+
+                rates = mt5.copy_rates_from_pos(symbol, tf, 0, 1)
+                current_high = rates[0]['high'] if rates else None
+                current_low = rates[0]['low'] if rates else None
+                live_price = rates[0]['close'] if rates else None
+
+                # --- CẢI TIẾN: Logic cho cột "Check" - Hiển thị TẤT CẢ các nghiệm đã đi qua ---
+                passed_solutions = []
+                if current_high is not None and current_low is not None:
+                    for i, sol in enumerate(sols, 1):
+                        if math.isfinite(sol) and current_low <= sol <= current_high:
+                            passed_solutions.append(f"Nghiệm {i}: {sol:.{decimal_places}f}")
+
+                if passed_solutions:
+                    check_text = "Đã đi qua: " + ", ".join(passed_solutions)
+                else:
+                    check_text = "Chưa đi qua"
+                # --- KẾT THÚC CẢI TIẾN "Check" ---
+
+                # --- ĐIỀU CHỈNH: Logic cho cột "Warning" - Hiển thị TẤT CẢ các nghiệm gần ---
+                close_solutions_info = []
+                if live_price is not None:
+                    for i, sol in enumerate(sols, 1):
+                        if math.isfinite(sol):
+                            diff = abs(live_price - sol)
+                            if diff <= 10 * pip_size:
+                                close_solutions_info.append(f"Rất gần Nghiệm {i}: {sol:.{decimal_places}f} ({diff / pip_size:.0f} pip)")
+                            elif diff <= 50 * pip_size:
+                                close_solutions_info.append(f"Gần Nghiệm {i}: {sol:.{decimal_places}f} ({diff / pip_size:.0f} pip)")
+                    
+                    if close_solutions_info:
+                        warning_text = "; ".join(close_solutions_info)
+                    elif sols:
+                        warning_text = "Không có nghiệm nào gần ( > 50 pip)"
+                    else:
+                        warning_text = "Không tìm thấy nghiệm hợp lệ"
+                else:
+                    warning_text = "Không có giá Live"
+                # --- KẾT THÚC ĐIỀU CHỈNH "Warning" ---
+
+                live_price_text = round(live_price, decimal_places) if live_price is not None else "N/A"
+
+                self.result_table.insert(
+                    "", "end",
+                    values=(symbol, tf_str, result_text, check_text, warning_text, live_price_text)
+                )
+            except RuntimeError as e: # Bắt lỗi nếu không đủ dữ liệu nến
+                messagebox.showerror("Lỗi dữ liệu", f"Không đủ dữ liệu cho {symbol} {tf_str}: {e}")
+            except Exception as e: # Bắt các lỗi chung khác
+                messagebox.showerror("Lỗi", f"Lỗi khi tính toán cho {symbol} {tf_str}: {e}")
+
+    def reset(self):
+        """
+        Đặt lại các trường nhập liệu về giá trị mặc định và xóa toàn bộ dữ liệu trong bảng kết quả.
+        Đặt lại thanh tiến trình và nhãn trạng thái.
+        """
+        self.symbol_combobox.set(self.symbols[0])
+        self.timeframe_combobox.set(self.timeframes[0])
+        for item in self.result_table.get_children():
+            self.result_table.delete(item)
+        self.progress['value'] = 0
+        self.status_label.config(text="Chưa bắt đầu tìm kiếm")
+
+    def exit_program(self):
+        """
+        Ngắt kết nối an toàn với MetaTrader 5 và thoát ứng dụng Tkinter.
+        """
+        if self.connected:
+            mt5.shutdown()
+        self.root.quit()
+
+
+def main():
+    root = tk.Tk()
+    app = TradingApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
